@@ -422,17 +422,17 @@ module/
 
 ## 👥 作者
 
-- **开发者**: 嵌入式开发团队
+- **开发者**: chengyuchung and you
 - **维护者**: 
-- **贡献者**: 社区开源贡献者
+- **贡献者**: all
 
 ---
 
 ## 💬 交流
 
 - 📧 Email: 
-- 💬 讨论: [Discussions](https://github.com/YOUR_USERNAME/embedded-c-conventions/discussions)
-- 🐛 问题: [Issues](https://github.com/YOUR_USERNAME/embedded-c-conventions/issues)
+- 💬 讨论: [Discussions](https://github.com/chengyuchung/embedded-c-conventions/discussions)
+- 🐛 问题: [Issues](https://github.com/chengyuchung/embedded-c-conventions/issues)
 
 ---
 
