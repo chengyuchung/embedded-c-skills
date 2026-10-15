@@ -185,9 +185,9 @@ typedef struct {
 
 **Rationale**: Balance between clarity and code readability. Only document what's necessary. Focus comments on **declarations** (.h files) and **critical sections** in implementation.
 
-#### 4.1 Header File (.h) Documentation - REQUIRED
+#### 4.1 Header File (.h) Documentation
 
-Every declaration in .h files **must** be documented:
+Document public APIs sufficiently for callers to use them safely. For non-obvious or contract-bearing declarations, describe purpose, parameter constraints, return values, ownership, blocking behavior, and side effects as applicable. Simple declarations whose names and types make the contract obvious do not need repetitive full comments. Document macros, enum values, and structure members when their meaning or valid range is not self-evident.
 
 ```c
 /**
@@ -378,10 +378,10 @@ if (result != ERROR_SUCCESS)
 **Rationale**: Well-organized structures make interfaces clear and catch bugs at compile time.
 
 **Rules**:
-1. Group related fields together
-2. Order by size (largest first) to minimize padding
-3. Use typedef for easier forward declarations
-4. Document each field
+1. Group related fields together and document fields whose meaning or constraints are not obvious.
+2. For private in-memory structures, consider field ordering to reduce padding when memory savings matter and layout is controlled by the module.
+3. Do not reorder public ABI types, hardware register maps, or protocol/persistent representations solely to reduce padding; their layout is part of the contract.
+4. Use typedef where it improves interface readability and forward declarations are needed.
 
 ```c
 typedef struct {
@@ -598,10 +598,11 @@ log_info("Temperature: %d°C", temp);
 #### 10.1 Critical Section Protection
 
 **Rules**:
-- Identify all shared resources (variables, registers)
-- Document which operations are critical
-- Use `DISABLE_INTERRUPTS()` for ISR conflicts
-- Use mutex/semaphore for multi-task conflicts
+- Identify each shared resource and its readers, writers, and execution contexts.
+- Select synchronization according to the sharing context; see section 16 for ISR/task, task/task, and DMA/CPU guidance.
+- Use platform or RTOS critical-section APIs for short ISR-shared updates; use RTOS synchronization primitives for task/task sharing.
+- Do not assume disabling interrupts protects task/task access, DMA access, or every multi-core context.
+- Document the protected invariant and keep critical sections bounded.
 
 **Example (中文注释):**
 ```c
@@ -641,9 +642,9 @@ ErrorCode_t uart_send_dma(const uint8_t *p_data, uint16_t len)
 #### 10.2 Volatile Variables in ISR
 
 **Rules**:
-- Global variables accessed from ISR must be `volatile`
-- Document which ISR accesses them
-- Mark them with `@isr` tag in comments
+- As a conservative default, declare shared objects accessed by an ISR and foreground code as `volatile`, unless the platform/compiler contract provides a documented reason not to. This helps prevent inappropriate compiler caching or elimination of accesses.
+- `volatile` is not sufficient for atomicity, mutual exclusion, ordering of multi-step operations, or DMA/cache coherency; add the required atomic operation, critical section, RTOS synchronization, or cache maintenance independently.
+- Document which ISR accesses each shared object and the separate synchronization mechanism; see section 16.
 
 **Example (中文注释):**
 ```c
@@ -974,9 +975,16 @@ sensor_state_t sensor_get_state(void);
 - ✅ 硬件更换时只改底层，业务逻辑不变
 - ✅ 易于多人协作开发
 
-#### 14.2 函数表模式 - 解决 Switch/If-Else 爆炸
+#### 14.2 分发结构选择：`switch` 或函数表
 
-**问题 - 硬编码的 switch 语句**:
+按可读性、扩展需求和运行时配置需求选择分发方式，不要把函数表作为消除 `switch` 的普遍目标。
+
+- 对有限、稳定、需要完整穷举的枚举状态或事件，优先考虑 `switch`。清晰的 `case`、`default` 和编译器穷举告警有助于发现遗漏。
+- 当处理项需要独立扩展、隔离测试、运行时注册/配置，或表驱动本身能显著减少重复时，考虑函数表。
+- 函数表需要验证索引/键值范围、函数指针非空和默认/未知项行为；不要仅为减少几行 `switch` 引入间接调用。
+- 避免的是难以维护的巨大分发逻辑，而不是 `switch` 语法本身。
+
+**函数表适用示例场景**:
 
 ```c
 // ❌ 问题：switch 语句过大，难以维护
@@ -1006,7 +1014,9 @@ void handle_command(uint8_t cmd_type, uint8_t *p_cmd)
 3. 命令处理逻辑散开在整个 switch 中
 4. 容易遗漏新增命令的初始化
 
-**解决 - 函数表模式 (中文注释)**:
+**函数表示例 (中文注释)**:
+
+函数表适用于处理项需要独立扩展、隔离测试或配置的情况。对于少量且稳定、需要穷举的命令，直接使用 `switch` 通常更简单清晰。
 
 ```c
 // ============================================================================
@@ -1356,11 +1366,11 @@ int main(void)
 
 #### 14.4 状态机模式 - 管理复杂的状态转换
 
-**场景**：设备有多个状态（IDLE → RUNNING → ERROR → IDLE），每个状态有不同的处理
+**场景**：设备有多个状态（IDLE → RUNNING → ERROR → IDLE），每个状态有不同的处理。对有限且稳定的状态集合，使用 `switch` 表达状态/事件转换通常最直观；当状态处理需要独立扩展或通过表配置时，再考虑函数表。
 
 ```c
 // ============================================================================
-// 状态机实现 - 函数表模式
+// 状态机实现 - 函数表备选模式
 // ============================================================================
 
 /**
@@ -1547,18 +1557,142 @@ SystemState_t system_get_state(void)
 
 ---
 
+### 15. Integer Arithmetic and Data Representation Safety
+
+**Rationale**: Integer promotions, signed overflow, narrowing conversions, and implicit byte order assumptions can produce undefined behavior, platform-dependent results, and bounds-check bypasses.
+
+#### 15.1 Integer Operations and Conversions
+
+**Rules**:
+- Use fixed-width integer types (`uint8_t`, `int16_t`, `uint32_t`, etc.) for protocol fields, hardware values, and quantities with defined widths. Use `size_t` for object sizes and array indexes.
+- Check arithmetic before performing it when overflow is possible. For bounds checks, prefer `offset <= capacity && length <= capacity - offset` over `offset + length <= capacity`.
+- Do not rely on signed integer overflow; it is undefined behavior in C. Use unsigned arithmetic only when modulo wraparound is intentional and documented.
+- Validate values before narrowing conversions. Make signedness changes explicit and ensure the source value is in range before casting.
+- Avoid mixing signed and unsigned values in comparisons or arithmetic unless the conversion is deliberate and safe.
+- Account for integer promotions in expressions involving `uint8_t` and `uint16_t`; cast only after validating the intermediate result and desired range.
+- Do not right-shift negative signed values; the result is implementation-defined. Use unsigned values or a defined division/bit-level operation appropriate to the requirement.
+- Shift counts must be non-negative and strictly less than the width of the promoted left operand. Use unsigned operands for bit masks and shifts.
+- Do not assume `sizeof` fits in a narrower integer type; validate before conversion when passing sizes to APIs with narrower length parameters.
+
+**Examples**:
+
+```c
+// Avoid overflow in offset + length.
+if (offset > capacity || length > capacity - offset)
+{
+    return ERROR_BUFFER_OVERFLOW;
+}
+
+// Validate before narrowing to an 8-bit protocol field.
+if (value > UINT8_MAX)
+{
+    return ERROR_INVALID_PARAM;
+}
+uint8_t field = (uint8_t)value;
+
+// Use an unsigned operand and a bounded shift count.
+uint32_t mask = (uint32_t)1U << bit_index;
+```
+
+#### 15.2 Protocol and Persistent Data Representation
+
+**Rules**:
+- Encode and decode each multi-byte protocol or persistent field explicitly using the specified byte order. Do not serialize by casting a structure pointer to a byte pointer.
+- Do not treat C structure layout, padding, alignment, or host byte order as a wire/storage format.
+- `enum`, `bool`, bit-fields, and compiler-specific `packed` structures are not stable wire or persistent representations by default. Map them to explicitly sized integer fields and validate decoded values.
+- Use `packed` only when required by a documented compiler/platform ABI or hardware interface. Document alignment and unaligned-access constraints, and verify generated layout with compile-time assertions or tests where supported.
+- Keep protocol field widths and byte order defined independently of the in-memory representation.
+
+**Example**:
+
+```c
+uint16_t value = (uint16_t)p_data[0]
+               | ((uint16_t)p_data[1] << 8);
+
+p_data[0] = (uint8_t)(value & UINT16_C(0x00FF));
+p_data[1] = (uint8_t)((value >> 8) & UINT16_C(0x00FF));
+```
+
+---
+
+### 16. Concurrency, `volatile`, and Shared Resources
+
+**Rationale**: `volatile` does not provide atomicity, mutual exclusion, or inter-thread/ISR synchronization. The correct mechanism depends on which execution contexts share the resource.
+
+#### 16.1 `volatile` Semantics
+
+**Rules**:
+- Use `volatile` for memory-mapped registers according to the hardware/compiler contract. As a conservative default, also declare objects shared between an ISR and foreground code as `volatile`, unless a documented platform/compiler contract provides a reason not to.
+- Treat `volatile` as an access-visibility measure only. It does not provide atomicity, mutual exclusion, inter-thread synchronization, memory ordering for unrelated data, or DMA cache coherency; add the required atomic operation, critical section, RTOS lock, barrier, or cache maintenance independently.
+- A `volatile` read-modify-write expression is not automatically atomic. Multi-byte accesses may also be non-atomic on the target CPU.
+- For each shared object, document its writer(s), reader(s), execution contexts, and synchronization mechanism. Mark ISR access in comments when useful, but do not infer the needed synchronization from the annotation alone.
+
+#### 16.2 Select Synchronization by Sharing Context
+
+- **ISR and task**: Keep ISR work bounded. Use platform-supported atomic operations for naturally supported atomic state, or a short ISR-safe critical section / interrupt-masking API for small shared updates. Use an RTOS ISR-safe queue, semaphore, or notification to transfer work to a task. Never call a task-only RTOS API from an ISR.
+- **Task and task**: Protect shared mutable state with the RTOS mutex/semaphore or another documented synchronization primitive. Use atomics only for operations whose semantics and memory ordering are sufficient; atomics do not make a multi-step invariant atomic.
+- **DMA and CPU**: Follow the MCU and cache documentation for DMA-accessible memory, cache clean/invalidate operations, alignment, ownership transfer, and memory barriers. `volatile` alone does not make DMA buffers coherent.
+- **Multiple writers**: Define a single owner where practical. Otherwise use a synchronization mechanism that protects the whole invariant, not just individual fields.
+
+#### 16.3 Critical Sections
+
+**Rules**:
+- Use the platform or RTOS-provided critical-section API; do not invent generic `DISABLE_INTERRUPTS()` / `ENABLE_INTERRUPTS()` wrappers without a defined contract.
+- The API must preserve and restore the prior interrupt mask/state, or correctly support nesting. Blindly enabling interrupts on exit can incorrectly enable interrupts that were already disabled by the caller.
+- Keep critical sections short and bounded. Do not block, allocate memory, log synchronously, or perform slow peripheral operations while holding a critical section or mutex.
+- Document the protected data and why the selected critical section is sufficient for the participating contexts.
+
+---
+
+### 17. Stack, Heap, and Real-Time Behavior
+
+**Rationale**: Memory budgets and bounded execution are correctness requirements in embedded systems, not only optimization concerns.
+
+#### 17.1 Stack and Heap
+
+**Rules**:
+- Define stack budgets for each RTOS task and for the interrupt/main stack where applicable. Check high-water marks or stack canaries during testing, and retain margin for worst-case call depth and interrupt nesting.
+- Avoid recursion and large automatic arrays on constrained stacks. Prefer static or caller-provided buffers when their lifetime and concurrency are well-defined; document the memory cost and sharing rules.
+- Decide explicitly whether dynamic allocation is allowed. If allowed, define permitted lifecycle phases, allocator constraints, fragmentation strategy, maximum allocation sizes, and failure handling.
+- Do not allocate or free memory from an ISR unless the allocator is explicitly documented as ISR-safe, bounded, and suitable for the system; the default rule is prohibited.
+- Every allocation failure must be handled. Do not assume initialization-time allocation always succeeds.
+
+#### 17.2 ISR and Timing Constraints
+
+**Rules**:
+- ISR handlers must have bounded execution time. Do not block, sleep/delay, wait for peripheral completion, perform unbounded loops, or call non-ISR-safe APIs from an ISR.
+- Defer lengthy processing, parsing, logging, and protocol/business work to a task using an ISR-safe handoff mechanism.
+- For timing-critical paths, specify and verify execution-time and blocking-time budgets, deadlines, and timeout behavior. Every wait for hardware or another task must have a defined timeout or documented bounded completion guarantee.
+- Do not use busy-wait loops where they can starve the scheduler or violate a timing budget; use an appropriate event, interrupt, or RTOS wait when available.
+
+---
+
+### 18. Build, Static Analysis, and Verification
+
+**Rationale**: A coding convention is only useful if the target configuration can enforce and verify it.
+
+**Rules**:
+- Pin or record the compiler/toolchain version, target architecture, ABI, language standard, relevant extensions, optimization settings, and linker configuration for reproducible builds.
+- Enable the project's agreed warning set and treat warnings as build failures where practical. New warnings must be fixed or narrowly suppressed with a documented reason; do not hide warnings through broad flags or casts.
+- Run static analysis and format/lint checks in the normal development workflow or CI. Keep suppressions local, justified, and reviewable.
+- Add unit tests for pure logic and boundary conditions. Prioritize protocol parsing/packing, integer limits, malformed or truncated frames, buffer boundaries, and error paths.
+- Perform target or hardware-in-the-loop validation for behavior that depends on peripherals, interrupt timing, DMA, memory layout, or compiler/ABI details; host tests alone are insufficient for these properties.
+- Record the commands or project targets used for build and verification so results can be reproduced.
+
+---
+
 ## Code Review Checklist - Extended
 
 When reviewing embedded C code, verify:
 
 **基础规范 (8 项)**
-- [ ] 没有魔法数字：所有常量都用宏定义
+- [ ] 有意义或可配置的常量有命名；不机械宏化明显的局部字面量
 - [ ] 大括号格式：所有 `{` `}` 都在新行
 - [ ] 变量命名：g_/s_/p_ 前缀一致
 - [ ] 注释规范：中文注释，函数有文档
 - [ ] 全局变量：都有 @rationale 说明
 - [ ] 错误处理：ErrorCode_t 返回，调用者检查
-- [ ] 结构体设计：字段分组、大小排序
+- [ ] 结构体设计：内部布局按需优化；协议、硬件和公开 ABI 布局保持契约
 - [ ] AI 工作流：代码有注释，没有额外 .md
 
 **函数设计 (5 项)**
@@ -1568,11 +1702,35 @@ When reviewing embedded C code, verify:
 - [ ] 嵌套深度：≤ 3 层或提前返回
 - [ ] 返回值检查：所有错误返回都被检查
 
-**并发安全 (4 项)**
-- [ ] Volatile 标记：ISR 访问的变量都标记
-- [ ] 临界段保护：多语句修改用 DISABLE_INTERRUPTS()
-- [ ] 文档标记：@isr 说明哪个 ISR 访问
-- [ ] 原子操作：组合操作都有保护
+**整数与数据表示 (6 项)**
+- [ ] 溢出检查：可能溢出的加减乘、长度和偏移计算都有安全检查
+- [ ] 转换检查：窄化和有符号/无符号转换经过范围验证
+- [ ] 移位安全：移位量有效，负有符号数不右移
+- [ ] 字节序显式：协议/持久化字段逐字段编解码
+- [ ] 不依赖结构布局：不直接序列化结构体，不默认使用 enum/bool/位域/packed 作格式
+- [ ] 线缆字段宽度：使用明确宽度并验证解码值
+
+**并发安全 (6 项)**
+- [ ] 同步机制匹配上下文：ISR/任务、任务/任务、DMA/CPU 分别评估
+- [ ] ISR 与前台共享对象默认使用 `volatile`；另行保证原子性、互斥、内存顺序及 DMA 一致性
+- [ ] 临界区使用平台/RTOS API，支持正确恢复中断状态及嵌套
+- [ ] 临界区和锁持有时间短且有界
+- [ ] ISR 使用 ISR-safe API，并将耗时工作移交任务
+- [ ] DMA 缓存维护、屏障和所有权按芯片文档处理
+
+**栈、堆与实时性 (5 项)**
+- [ ] 任务栈/中断栈有预算并通过高水位或 canary 检查
+- [ ] 受限路径没有不受控递归或大栈数组
+- [ ] 动态内存策略明确，分配失败有处理
+- [ ] ISR 无阻塞、延时、无界循环或非 ISR-safe 调用
+- [ ] 关键路径有执行/阻塞预算及超时策略
+
+**构建与验证 (5 项)**
+- [ ] 编译器、目标、ABI、语言标准和关键构建参数可追溯
+- [ ] 告警集明确；新增告警已修复或局部说明抑制原因
+- [ ] 静态分析与格式检查已运行
+- [ ] 单元测试覆盖协议、边界、畸形输入及错误路径
+- [ ] 硬件相关行为已在目标板或 HIL 验证
 
 **内存安全 (4 项)**
 - [ ] 缓冲验证：len 检查（>0 和 ≤ MAX）
@@ -1580,9 +1738,9 @@ When reviewing embedded C code, verify:
 - [ ] 边界检查：所有写操作都检查可用空间
 - [ ] 资源配对：init/close、acquire/release 配对
 
-**架构设计【新增】(6 项)**
+**架构设计 (6 项)**
 - [ ] 分层清晰：依赖单向，从上到下
-- [ ] 解耦充分：没有大的 switch/if-else，改用函数表
+- [ ] 分发结构合适：稳定且需穷举的有限状态优先考虑 switch；可扩展/可配置处理项再考虑函数表
 - [ ] 函数表设计：表项集中、处理函数独立
 - [ ] 虚接口：相同操作的不同实现用表格管理
 - [ ] 状态机：状态转换规则集中、处理函数独立
@@ -1599,13 +1757,13 @@ When reviewing embedded C code, verify:
 
 When writing embedded C code for the user:
 
-1. **Replace all magic numbers with macros** before writing functions, with module prefixes
+1. **Name meaningful constants** with macros or enum constants; avoid mechanically replacing obvious local literals
 2. **Name all variables consistently**: Global (`g_`), static (`s_`), pointer (`p_`), functions lowercase_with_underscores
 3. **Add comprehensive comments**: File headers, function headers, and explain *why* for hardware operations
 4. **Format all braces on new lines** consistently throughout the code
 5. **Document globals/statics**: Every global/static variable needs a comment explaining why it's not local
 6. **Use consistent error handling**: Functions return ErrorCode_t, callers check return values
-7. **Organize structures**: Group related fields, order by size, document each field
+7. **Organize structures**: Group related fields; optimize private in-memory layout only when useful, and preserve externally defined layouts
 8. **Avoid unnecessary globals**: Prefer static variables for file scope, or pass pointers to functions
 
 ---
